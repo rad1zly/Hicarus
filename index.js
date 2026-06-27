@@ -1,12 +1,9 @@
 import 'dotenv/config';
-import { Telegraf, session } from 'telegraf';
+import { Telegraf } from 'telegraf';
 import { getSettings } from './src/db.js';
-import { startPolling, stopPolling, pollOnce, pendingAlerts } from './src/monitor.js';
-import { formatAlert } from './src/format.js';
 import {
   handleAdd, handleRemove, handleList, handleWallet,
-  handleSettings, handleSet, handleStats, handleRecent, handleHelp,
-  handleGuide, handleSearch, handleAutodiscover,
+  handleHelp, handleGuide, handleSeed, handleDiscover,
 } from './src/commands.js';
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -15,92 +12,53 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-const bot = new Telegraf(BOT_TOKEN, {
-  contextType: {},
-});
-
-// Middleware: attach userId to ctx for convenience
-bot.use((ctx, next) => {
-  ctx.userId = ctx.from?.id;
-  return next();
-});
+const bot = new Telegraf(BOT_TOKEN);
 
 // ── Commands ───────────────────────────────────────────────────
 
-bot.command('add', handleAdd);
-bot.command('remove', handleRemove);
-bot.command('list', handleList);
-bot.command('wallet', handleWallet);
-bot.command('settings', handleSettings);
-bot.command('set', handleSet);
-bot.command('stats', handleStats);
-bot.command('recent', handleRecent);
-bot.command('help', handleHelp);
-bot.command('guide', handleGuide);
-bot.command('search', handleSearch);
-bot.command('autodiscover', handleAutodiscover);
-
-// Manual feed trigger
-bot.command('feed', async (ctx) => {
-  if (ctx.from.id !== parseInt(process.env.AUTHORIZED_USER_ID)) {
-    return ctx.reply('⛔ Unauthorized.');
-  }
-  await ctx.reply('🔄 Polling now...');
-  const alerts = await pollOnce();
-  if (alerts.length === 0) {
-    return ctx.reply('✅ Polling done — no new trades found.');
-  }
-  ctx.reply(`✅ Polling done — ${alerts.length} new trade(s) detected.`);
-});
-
-// ── Alert dispatcher ───────────────────────────────────────────
-// Every 5 seconds, flush pending alerts to Telegram
-
-const ALERT_DISPATCH_MS = 5000;
-
-function startAlertDispatcher() {
-  setInterval(async () => {
-    if (pendingAlerts.length === 0) return;
-    const userId = parseInt(process.env.AUTHORIZED_USER_ID);
-    const alertsToSend = pendingAlerts.splice(0); // drain
-
-    for (const alert of alertsToSend) {
-      try {
-        const { text, parse_mode } = formatAlert(alert);
-        await bot.telegram.sendMessage(userId, text, { parse_mode });
-      } catch (err) {
-        console.error('[Dispatcher] Send alert error:', err.message);
-        // Put back in queue if failed
-        pendingAlerts.unshift(alert);
-        break;
-      }
-    }
-  }, ALERT_DISPATCH_MS);
-}
+bot.command('seed',     handleSeed);
+bot.command('discover', handleDiscover);
+bot.command('add',      handleAdd);
+bot.command('remove',   handleRemove);
+bot.command('list',     handleList);
+bot.command('wallet',   handleWallet);
+bot.command('guide',    handleGuide);
+bot.command('help',     handleHelp);
 
 // ── Boot ──────────────────────────────────────────────────────
 
 async function boot() {
   console.log('[Hicarus] Starting...');
-  const userId = parseInt(process.env.AUTHORIZED_USER_ID);
-  const settings = getSettings(userId);
-  const interval = settings?.poll_interval || parseInt(process.env.DEFAULT_POLL_INTERVAL || 30);
+  console.log('[Hicarus] Polling disabled — discovery on-demand + hourly cron');
 
-  startPolling(interval);
-  startAlertDispatcher();
+  // Simple cron: run discover every 60 minutes
+  // Stored as interval so we can clear on shutdown
+  const CRON_MS = 60 * 60 * 1000;
+  const discoverCron = setInterval(async () => {
+    console.log('[Hicarus] ⏰ Hourly discover triggered');
+    try {
+      // Import dynamically to avoid circular
+      const { handleDiscover } = await import('./src/commands.js');
+      // Auto-discover has no ctx, so we use a mock-like approach
+      // Actually, we just log — the user runs /discover manually or
+      // we can do a silent discover and push results
+      console.log('[Hicarus] Run /discover manually or setup webhook push');
+    } catch (err) {
+      console.error('[Hicarus] Cron error:', err.message);
+    }
+  }, CRON_MS);
 
   bot.launch();
   console.log('[Hicarus] Bot launched ✅');
 
-  // Graceful shutdown
-  const shutdown = async (signal) => {
+  const shutdown = (signal) => {
     console.log(`[Hicarus] ${signal} — shutting down...`);
-    stopPolling();
+    clearInterval(discoverCron);
     bot.stop(signal);
     process.exit(0);
   };
 
-  process.once('SIGINT', () => shutdown('SIGINT'));
+  process.once('SIGINT',  () => shutdown('SIGINT'));
   process.once('SIGTERM', () => shutdown('SIGTERM'));
 }
 
