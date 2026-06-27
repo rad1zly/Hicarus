@@ -282,13 +282,26 @@ def discover():
               + ' activities for ' + creator[:12] + '...')
 
     # 4. For each token, check if creator is a Distributor using cached activities
+    #    Seeds are already tracked — skip them. Find NEW creators only.
     dev_map = {}  # creator_addr -> {count, pnl, tokens, sell_timestamps}
+    new_wallets = {}  # creator_addr -> list of (token_addr, symbol) for NEW wallets only
+
     for creator, token_list in creator_tokens.items():
+        if creator in seeds:
+            # Seed = already in watchlist, skip from discovery
+            print('[Hicarus] SKIP seed: ' + creator[:12] + '...')
+            continue
+
+        # NEW creator — not in seeds, check their pattern
         cached_activities = creator_activity_cache.get(creator, [])
+        creator_passed = False  # did this creator pass the one-shot filter?
+
         for token_addr, symbol in token_list:
             is_dist, pnl, sell_ts = check_distributor_from_activities(cached_activities, token_addr)
             if not is_dist:
                 continue
+
+            creator_passed = True
             if creator not in dev_map:
                 dev_map[creator] = {'count': 0, 'pnl': 0.0, 'tokens': [], 'timestamps': []}
             dev_map[creator]['count'] += 1
@@ -299,10 +312,21 @@ def discover():
             print('[Hicarus] DIST: ' + creator[:12] + '... created ' + symbol
                   + ' (PnL ' + str(round(pnl, 2)) + ')')
 
-    sorted_devs = sorted(dev_map.items(), key=lambda x: (x[1]['count'], x[1]['pnl']), reverse=True)
-    print('[Hicarus] ' + str(len(sorted_devs)) + ' Distributors found')
+        # Track new wallets regardless of whether they passed (for info)
+        if creator not in new_wallets:
+            new_wallets[creator] = token_list
 
-    # 5. Auto-add
+    # Report new wallets found (passed or not)
+    non_dist_wallets = {c: t for c, t in new_wallets.items() if c not in dev_map}
+    if non_dist_wallets:
+        print('[Hicarus] ' + str(len(non_dist_wallets)) + ' new creators checked — no one-shot pattern: '
+              + ', '.join(c[:12] + '...' for c in non_dist_wallets))
+
+    sorted_devs = sorted(dev_map.items(), key=lambda x: (x[1]['count'], x[1]['pnl']), reverse=True)
+    new_checked = len(new_wallets)
+    print('[Hicarus] ' + str(len(sorted_devs)) + ' NEW Distributors found (checked ' + str(new_checked) + ' new creators)')
+
+    # 5. Auto-add (new wallets only)
     conn2 = init_db()
     added = []
     for addr, info in sorted_devs:
@@ -319,8 +343,8 @@ def discover():
     lines.append('🎯 *Hicarus Discover — ' + now_str + '*')
     lines.append('Target: ON-CHAIN CREATOR (bukan sniper/bundler)')
     lines.append('Filter: creates token → BUY launch → SELL ALL one-shot ≤60s → pump')
-    lines.append(str(len(seeds)) + ' watchlist · ' + str(len(tokens)) + ' token · '
-                 + str(len(sorted_devs)) + ' Distributor')
+    lines.append(str(len(seeds)) + ' seeds · ' + str(len(tokens)) + ' token · '
+                 + str(new_checked) + ' creator checked → ' + str(len(sorted_devs)) + ' Distributor')
     lines.append('')
 
     if added:
