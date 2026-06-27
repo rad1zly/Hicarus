@@ -1,0 +1,17 @@
+{
+  "name": "walletfeeder",
+  "version": "0.1.0",
+  "description": "Smart Money wallet pooler — GMGN API + Telegram alerts",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "better-sqlite3": "^11.8.1",
+    "dotenv": "^16.4.7",
+    "telegraf": "^4.16.3"
+  }
+}
