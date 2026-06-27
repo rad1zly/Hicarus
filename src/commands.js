@@ -286,7 +286,7 @@ export async function handleRecent(ctx) {
 }
 
 export async function handleHelp(ctx) {
-  const text = `🆘 *WalletFeeder — Help*\n\n` +
+  const text = `🆘 *Hicarus — Help*\n\n` +
     `*Wallet Management*\n` +
     `/add <wallet> [label]  — Tambah wallet\n` +
     `/remove <wallet>       — Hapus wallet\n` +
@@ -306,7 +306,7 @@ export async function handleHelp(ctx) {
     `/stats                 — Bot statistics\n` +
     `/recent                — Recent alerts\n` +
     `/help                  — Show this\n\n` +
-    `WalletFeeder memantau wallet via GMGN API dan menyimpan alerts ke database.`;
+    `Hicarus memantau wallet via GMGN API dan menyimpan alerts ke database.`;
   ctx.reply(text, { parse_mode: 'Markdown' });
 }
 

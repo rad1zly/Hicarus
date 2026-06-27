@@ -1,4 +1,4 @@
-# WalletFeeder
+# Hicarus
 
 **Smart Money Wallet Pooler** — Solana reverse copy trade signal bot.
 
@@ -16,7 +16,7 @@ Dev CREATE token → DEV BUY (hold) → DEV SELL 🚨
                               Price distributes up → you SCALP SELL
 ```
 
-WalletFeeder polls GMGN every 30s, detects **SELL events** from tracked dev wallets, and sends Telegram alerts so you can enter simultaneously with the dev's distribution — then ride the momentum upward.
+Hicarus polls GMGN every 30s, detects **SELL events** from tracked dev wallets, and sends Telegram alerts so you can enter simultaneously with the dev's distribution — then ride the momentum upward.
 
 ---
 
@@ -78,7 +78,7 @@ The key: after dev sells, new buyers absorb the supply and price **distributes u
 
 ### 1. Install dependencies
 ```bash
-cd walletfeeder
+cd hicarus
 npm install
 ```
 
@@ -101,9 +101,9 @@ MIN_USD_THRESHOLD=5
 ```bash
 node index.js
 # or with PM2:
-pm2 start index.js --name walletfeeder
+pm2 start index.js --name hicarus
 pm2 save
-pm2 logs walletfeeder
+pm2 logs hicarus
 ```
 
 ---
@@ -139,7 +139,7 @@ The `/autodiscover` command implements a rule-based discovery loop:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      WalletFeeder                            │
+│                      Hicarus                            │
 │                  Node.js + Telegraf                         │
 │                                                             │
 │  Telegram ──► commands.js ──► db.js ──► SQLite             │
@@ -156,7 +156,7 @@ The `/autodiscover` command implements a rule-based discovery loop:
 
 ### File Structure
 ```
-walletfeeder/
+hicarus/
 ├── index.js              # Bot init, polling, alert dispatcher
 ├── package.json
 ├── .env                  # Credentials (not committed)
@@ -182,7 +182,7 @@ user_settings (user_id, poll_interval, auto_forward, alert_buys, alert_sells, mi
 ## Reverse Copy Trade Flow
 
 ```
-1. WalletFeeder polls GMGN every 30s
+1. Hicarus polls GMGN every 30s
 2. Dev wallet SELL detected
 3. Alert sent: "🚀 DEV SOLD [TICKER] @ $X — BUY NOW"
 4. You BUY (manually or via SnipeTrenchBot)

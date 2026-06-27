@@ -11,7 +11,7 @@ import {
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) {
-  console.error('[WalletFeeder] BOT_TOKEN not set in .env');
+  console.error('[Hicarus] BOT_TOKEN not set in .env');
   process.exit(1);
 }
 
@@ -81,7 +81,7 @@ function startAlertDispatcher() {
 // ── Boot ──────────────────────────────────────────────────────
 
 async function boot() {
-  console.log('[WalletFeeder] Starting...');
+  console.log('[Hicarus] Starting...');
   const userId = parseInt(process.env.AUTHORIZED_USER_ID);
   const settings = getSettings(userId);
   const interval = settings?.poll_interval || parseInt(process.env.DEFAULT_POLL_INTERVAL || 30);
@@ -90,11 +90,11 @@ async function boot() {
   startAlertDispatcher();
 
   bot.launch();
-  console.log('[WalletFeeder] Bot launched ✅');
+  console.log('[Hicarus] Bot launched ✅');
 
   // Graceful shutdown
   const shutdown = async (signal) => {
-    console.log(`[WalletFeeder] ${signal} — shutting down...`);
+    console.log(`[Hicarus] ${signal} — shutting down...`);
     stopPolling();
     bot.stop(signal);
     process.exit(0);
@@ -105,6 +105,6 @@ async function boot() {
 }
 
 boot().catch(err => {
-  console.error('[WalletFeeder] Boot error:', err);
+  console.error('[Hicarus] Boot error:', err);
   process.exit(1);
 });

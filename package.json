@@ -1,5 +1,5 @@
 {
-  "name": "walletfeeder",
+  "name": "hicarus",
   "version": "0.1.0",
   "description": "Smart Money wallet pooler — GMGN API + Telegram alerts",
   "main": "index.js",
