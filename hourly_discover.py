@@ -3,17 +3,19 @@
 Hicarus — Hourly Discover
 Run by cron every hour.
 Self-sustaining: uses ALL active watchlist wallets as seeds each run.
-Compounds discovery over time.
+Only finds "The Distributor" — dev that BUY at launch and SELL ALL in ONE tx <=60s.
 """
 import subprocess, json, urllib.request, urllib.parse, sqlite3, os
 from datetime import datetime
 
 # Config
-DB_FILE  = '/home/ubuntu/hicarus/data/wallets.db'
-CHAT_ID  = '6170215817'
-MIN_CONF = 3   # auto-add wallets with >=3 appearances
-MAX_TOKENS_PER_WALLET = 20   # tokens to check per wallet
-MAX_TRADERS_PER_TOKEN = 25   # traders to check per token
+DB_FILE        = '/home/ubuntu/hicarus/data/wallets.db'
+CHAT_ID        = '6170215817'
+MIN_CONF       = 2    # auto-add wallets with >=2 appearances (strict filter = lower volume)
+MAX_TOKENS     = 20   # tokens to check per wallet
+MAX_TRADERS    = 20   # traders to check per token
+ONE_SHOT_MIN   = 0.88 # ≥88% of buy amount in ONE sell tx
+SELL_GAP_MAX   = 60   # seconds between buy and sell
 
 # ── Helpers ─────────────────────────────────────────────────────
 
@@ -38,11 +40,7 @@ def gmgn():
         return []
 
 def tg_send(text):
-    payload = {
-        'chat_id': CHAT_ID,
-        'text': text,
-        'parse_mode': 'Markdown',
-    }
+    payload = {'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}
     data = urllib.parse.urlencode(payload).encode()
     req = urllib.request.Request(
         'https://api.telegram.org/bot' + get_env('BOT_TOKEN') + '/sendMessage',
@@ -86,6 +84,57 @@ def db_add(conn, addr, label, conf, pnl):
 def db_get_active(conn):
     return [row[0] for row in conn.execute('SELECT wallet FROM watchlist WHERE active=1').fetchall()]
 
+# ── Check if a trader does ONE-SHOT sell on a token ────────────
+# Returns (bool, float) = (is_one_shot, sell_pnl)
+
+def check_one_shot(wallet_addr, token_addr):
+    """
+    Fetch wallet's txs for this token.
+    Returns True if wallet BUYs and then SELLs ALL (>88% of buy amt) in ONE tx within 60s.
+    """
+    subprocess.run(
+        'gmgn-cli portfolio activity --chain sol --wallet ' + wallet_addr + ' --limit 30 2>/dev/null > /tmp/gmgn_out.txt',
+        shell=True, timeout=30
+    )
+    activities = gmgn()
+
+    # Filter to this token only
+    txs = [a for a in activities
+           if a.get('event_type') in ('buy', 'sell')
+           and a.get('token', {}).get('address') == token_addr]
+
+    if not txs:
+        return False, 0.0
+
+    # Sort by timestamp
+    txs.sort(key=lambda x: x.get('timestamp', 0))
+
+    buy_txs  = [t for t in txs if t.get('event_type') == 'buy']
+    sell_txs = [t for t in txs if t.get('event_type') == 'sell']
+
+    if not buy_txs or not sell_txs:
+        return False, 0.0
+
+    # Total bought amount
+    total_bought = sum(float(t.get('token_amount', 0)) for t in buy_txs)
+    first_sell = sell_txs[0]
+    first_sell_amt = float(first_sell.get('token_amount', 0))
+    first_buy = buy_txs[0]
+
+    # Check: first sell is within 60s of first buy
+    gap = first_sell.get('timestamp', 0) - first_buy.get('timestamp', 0)
+    if gap < 0 or gap > SELL_GAP_MAX:
+        return False, 0.0
+
+    # Check: first sell amount >= 88% of total bought (one-shot)
+    pct = first_sell_amt / total_bought if total_bought > 0 else 0
+    if pct < ONE_SHOT_MIN:
+        return False, 0.0
+
+    # One-shot confirmed
+    sell_pnl = sum(float(t.get('profit', 0)) for t in sell_txs)
+    return True, sell_pnl
+
 # ── Discover ────────────────────────────────────────────────────
 
 def discover():
@@ -97,16 +146,16 @@ def discover():
         tg_send('📭 *Hicarus*\n\nNo wallets in watchlist. Run `/discover` to seed manually.')
         return
 
-    print('[Hicarus] Seeds this run: ' + str(len(seeds)))
-    tg_send('🔍 *Hicarus Discover*\n' + str(len(seeds)) + ' wallets in watchlist — analyzing...')
+    print('[Hicarus] Seeds: ' + str(len(seeds)))
+    tg_send('🔍 *Hicarus Discover*\n' + str(len(seeds)) + ' wallets — analyzing one-shot pattern...')
 
-    token_map = {}   # token_addr -> {symbol, created_by}
-    dev_map   = {}   # dev_addr -> {count, pnl, tokens, tags}
+    token_map = {}  # token_addr -> symbol
+    dev_map   = {}  # dev_addr -> {count, pnl, tokens}
 
-    # 1. Collect tokens from ALL watchlist wallets
+    # 1. Collect tokens from all watchlist wallets
     for wallet in seeds:
         subprocess.run(
-            'gmgn-cli portfolio activity --chain sol --wallet ' + wallet + ' --limit ' + str(MAX_TOKENS_PER_WALLET) + ' 2>/dev/null > /tmp/gmgn_out.txt',
+            'gmgn-cli portfolio activity --chain sol --wallet ' + wallet + ' --limit ' + str(MAX_TOKENS) + ' 2>/dev/null > /tmp/gmgn_out.txt',
             shell=True, timeout=30
         )
         for a in gmgn():
@@ -116,51 +165,73 @@ def discover():
                     token_map[tok] = a['token'].get('symbol', tok[:8])
 
     tokens = list(token_map.items())
-    tg_send('📊 ' + str(len(tokens)) + ' token ditemukan. Cek trader data...')
-    print('[Hicarus] ' + str(len(tokens)) + ' tokens collected from ' + str(len(seeds)) + ' wallets')
+    tg_send('📊 ' + str(len(tokens)) + ' token. Checking traders for one-shot pattern...')
+    print('[Hicarus] ' + str(len(tokens)) + ' tokens collected')
 
-    # 2. Find dev wallets across all tokens
-    for token_addr, symbol in tokens[:30]:
+    # 2. For each token, find traders with dev_team/creator tag
+    #    Then verify if they do ONE-SHOT pattern
+    for token_addr, symbol in tokens[:25]:
         subprocess.run(
-            'gmgn-cli token traders --chain sol --address ' + token_addr + ' --limit ' + str(MAX_TRADERS_PER_TOKEN) + ' --raw 2>/dev/null > /tmp/gmgn_out.txt',
+            'gmgn-cli token traders --chain sol --address ' + token_addr + ' --limit ' + str(MAX_TRADERS) + ' --raw 2>/dev/null > /tmp/gmgn_out.txt',
             shell=True, timeout=30
         )
-        for t in gmgn():
+        try:
+            traders_raw = json.loads(open('/tmp/gmgn_out.txt').read())
+            traders = traders_raw.get('list', traders_raw) if isinstance(traders_raw, dict) else traders_raw
+        except:
+            continue
+
+        seen_per_token = set()  # dedup: one entry per (wallet, token)
+        for t in traders:
+            if not isinstance(t, dict):
+                continue
             tags = t.get('maker_token_tags', []) + t.get('tags', [])
-            if ('dev_team' in tags or 'creator' in tags) and t.get('address') not in seeds:
-                addr = t['address']
-                profit = float(t.get('profit') or 0)
-                if addr not in dev_map:
-                    dev_map[addr] = {'count': 0, 'pnl': 0.0, 'tokens': [], 'tags': list(set(tags))}
-                dev_map[addr]['count'] += 1
-                dev_map[addr]['pnl'] += profit
-                if symbol not in dev_map[addr]['tokens']:
-                    dev_map[addr]['tokens'].append(symbol)
+            if ('dev_team' not in tags and 'creator' not in tags):
+                continue
+            addr = t.get('address', '')
+            if addr in seeds:
+                continue
+            if addr in seen_per_token:
+                continue
+            seen_per_token.add(addr)
+
+            # Verify one-shot pattern
+            is_os, pnl = check_one_shot(addr, token_addr)
+            if not is_os:
+                continue  # Skip — not a true Distributor
+
+            if addr not in dev_map:
+                dev_map[addr] = {'count': 0, 'pnl': 0.0, 'tokens': []}
+            dev_map[addr]['count'] += 1
+            dev_map[addr]['pnl'] += pnl
+            if symbol not in dev_map[addr]['tokens']:
+                dev_map[addr]['tokens'].append(symbol)
+            print('[Hicarus] ONE-SHOT: ' + addr[:12] + '... on ' + symbol + ' (PnL ' + str(round(pnl, 2)) + ')')
 
     sorted_devs = sorted(dev_map.items(), key=lambda x: (x[1]['count'], x[1]['pnl']), reverse=True)
-    print('[Hicarus] ' + str(len(sorted_devs)) + ' dev wallets found')
+    print('[Hicarus] ' + str(len(sorted_devs)) + ' Distributors found')
 
-    # 3. Reopen DB and auto-add new HIGH confidence wallets
+    # 3. Auto-add to DB
     conn2 = init_db()
     added = []
     for addr, info in sorted_devs:
         if info['count'] >= MIN_CONF and not db_has(conn2, addr):
-            label = 'Auto #' + str(info['count']) + 'x ' + ', '.join(info['tokens'][:3])
+            label = 'Distributor #' + str(info['count']) + 'x ' + ', '.join(info['tokens'][:3])
             db_add(conn2, addr, label, info['count'], info['pnl'])
             added.append((addr, info))
-            print('[Hicarus] AUTO-ADDED: ' + addr[:12] + '... (' + str(info['count']) + 'x, PnL ' + str(round(info['pnl'], 2)) + ')')
+            print('[Hicarus] AUTO-ADDED: ' + addr[:12] + '... (' + str(info['count']) + 'x)')
     conn2.close()
 
     # 4. Format results
     now_str = datetime.now().strftime('%H:%M')
     lines = []
     lines.append('🎯 *Hicarus Discover — ' + now_str + '*')
-    lines.append(str(len(seeds)) + ' wallets in watchlist · ' + str(len(tokens)) + ' token · ' + str(len(sorted_devs)) + ' dev wallet ditemukan')
-    lines.append('_confidence = appearances × PnL_')
+    lines.append('Filter: BUY launch → SELL ALL in ONE tx ≤60s')
+    lines.append(str(len(seeds)) + ' watchlist · ' + str(len(tokens)) + ' token · ' + str(len(sorted_devs)) + ' Distributor')
     lines.append('')
 
     if added:
-        lines.append('✅ *' + str(len(added)) + ' wallet AUTO-ADDED to watchlist*')
+        lines.append('✅ *' + str(len(added)) + ' Distributor AUTO-ADDED*')
         for addr, info in added[:8]:
             pnl_str = '+' + str(round(info['pnl'], 2)) if info['pnl'] >= 0 else str(round(info['pnl'], 2))
             lines.append('`' + addr + '`')
@@ -171,10 +242,9 @@ def discover():
 
     high   = [(a, d) for a, d in sorted_devs if d['count'] >= MIN_CONF]
     medium = [(a, d) for a, d in sorted_devs if d['count'] == 2]
-    low    = [(a, d) for a, d in sorted_devs if d['count'] == 1]
 
     if high:
-        lines.append('🔥 *HIGH CONFIDENCE* (≥' + str(MIN_CONF) + 'x)')
+        lines.append('🔥 *HIGH* (≥' + str(MIN_CONF) + 'x)')
         for i, (addr, info) in enumerate(high[:8]):
             pnl_str = '+' + str(round(info['pnl'], 2)) if info['pnl'] >= 0 else str(round(info['pnl'], 2))
             lines.append(str(i + 1) + '. `' + addr + '`')
@@ -189,15 +259,12 @@ def discover():
             lines.append('• `' + addr + '` · ' + str(info['count']) + 'x · PnL: ' + pnl_str)
         lines.append('')
 
-    if low:
-        lines.append('🟡 *LOW* (1x) — cek /wallet ' + low[0][0] + ' untuk detail')
-        lines.append('')
-
     lines.append('━━━━━━━━━━━━━━━━━━━━')
+    lines.append('One-shot = SELL ≥88% of buy in ONE tx ≤60s')
     lines.append('Next run: 1 jam lagi ⏰')
 
     tg_send('\n'.join(lines))
-    print('[Hicarus Discover] Done — ' + str(len(added)) + ' auto-added, ' + str(len(sorted_devs)) + ' total found, ' + str(len(seeds)) + ' seeds')
+    print('[Hicarus Discover] Done — ' + str(len(added)) + ' added, ' + str(len(sorted_devs)) + ' total')
 
 if __name__ == '__main__':
     discover()
