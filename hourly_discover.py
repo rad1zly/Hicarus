@@ -19,6 +19,7 @@ DB_FILE       = '/home/ubuntu/hicarus/data/wallets.db'
 CHAT_ID       = '6170215817'
 MIN_CONF      = 2
 MAX_TOKENS    = 20
+MAX_ACTIVITY_PAGES = 10   # ~7-10 days back (30 trades/page × 10 = 300 trades max)
 SELL_GAP_MAX  = 60   # seconds between buy and sell
 PUMP_LOOKBACK = 120  # seconds after sell to check kline
 ONE_SHOT_MIN  = 0.50 # ≥50% of buy amount in one sell tx (creator typical = 50% chunk)
@@ -41,6 +42,45 @@ def gmgn_json(cmd):
         return json.loads(raw[s:e]) if s >= 0 else []
     except:
         return []
+
+def gmgn_activity(wallet_addr, max_pages=MAX_ACTIVITY_PAGES):
+    """
+    Fetch wallet activity across multiple pages (7 days back).
+    Returns list of activity dicts.
+    """
+    seven_days_ago = int(datetime.now().timestamp()) - 7 * 24 * 3600
+    all_activities = []
+    cursor = ''
+
+    for _ in range(max_pages):
+        cmd = (
+            'gmgn-cli portfolio activity --chain sol --wallet ' + wallet_addr
+            + ' --limit 30' + (' --cursor ' + cursor if cursor else '') + ' --raw'
+        )
+        subprocess.run(cmd + ' 2>/dev/null > /tmp/gmgn_out.txt', shell=True, timeout=30)
+        try:
+            with open('/tmp/gmgn_out.txt') as f:
+                data = json.load(f)
+        except:
+            break
+
+        page_activities = data.get('activities', [])
+        if not page_activities:
+            break
+
+        # Filter: only keep activities from last 7 days
+        for a in page_activities:
+            if a.get('timestamp', 0) >= seven_days_ago:
+                all_activities.append(a)
+            else:
+                # Past 7 days — stop paging, don't add
+                return all_activities
+
+        cursor = data.get('next', '')
+        if not cursor:
+            break
+
+    return all_activities
 
 def gmgn_token_info(token_addr):
     """Get token info including dev.creator_address"""
@@ -139,17 +179,11 @@ def check_pump(token_addr, sell_timestamp):
 
 # ── Check if a wallet is a Distributor on a specific token ─────
 
-def check_distributor(wallet_addr, token_addr):
+def check_distributor_from_activities(activities, token_addr):
     """
-    Full Distributor check for ONE token:
-    1. Wallet must have BUY + SELL on this token
-    2. First SELL must be ≥88% of buy amount, within 60s
-    3. Price must pump after sell (kline or skip if no kline)
+    Full Distributor check for ONE token using pre-fetched activities.
     Returns (is_distributor, sell_pnl, sell_timestamp)
     """
-    activities = gmgn_json(
-        'gmgn-cli portfolio activity --chain sol --wallet ' + wallet_addr + ' --limit 30'
-    )
 
     txs = [a for a in activities
            if a.get('event_type') in ('buy', 'sell')
@@ -208,14 +242,13 @@ def discover():
     tg_send('🔍 *Hicarus Discover*\n' + str(len(seeds)) + ' wallets — finding Distributors...\n(creator = on-chain token creator)')
 
     token_map = {}   # token_addr -> symbol
-    dev_map   = {}   # creator_addr -> {count, pnl, tokens, sell_timestamps}
+    creator_set = set()  # unique creator addresses
 
-    # 1. Collect tokens from all watchlist wallets
+    # 1. Collect tokens from all watchlist wallets (also collect seed activities)
+    all_seed_activities = []
     for wallet in seeds:
-        activities = gmgn_json(
-            'gmgn-cli portfolio activity --chain sol --wallet ' + wallet
-            + ' --limit ' + str(MAX_TOKENS)
-        )
+        activities = gmgn_activity(wallet)
+        all_seed_activities.extend(activities)
         for a in activities:
             if a.get('event_type') == 'sell' and a.get('token', {}).get('address'):
                 tok = a['token']['address']
@@ -226,33 +259,50 @@ def discover():
     tg_send('📊 ' + str(len(tokens)) + ' token found. Checking creators...')
     print('[Hicarus] ' + str(len(tokens)) + ' tokens collected')
 
-    # 2. For each token, get ON-CHAIN creator, check if they do one-shot
-    for token_addr, symbol in tokens[:25]:
+    # 2. Get all unique creators (fetch token info in batch)
+    creator_tokens = {}  # creator -> list of (token_addr, symbol)
+    for token_addr, symbol in tokens:
         token_info = gmgn_token_info(token_addr)
         dev_info   = token_info.get('dev', {}) or {}
         creator    = dev_info.get('creator_address', '')
-
         if not creator:
             continue
+        creator_set.add(creator)
+        if creator not in creator_tokens:
+            creator_tokens[creator] = []
+        creator_tokens[creator].append((token_addr, symbol))
 
-        is_dist, pnl, sell_ts = check_distributor(creator, token_addr)
-        if not is_dist:
-            continue
+    print('[Hicarus] ' + str(len(creator_set)) + ' unique creators')
 
-        if creator not in dev_map:
-            dev_map[creator] = {'count': 0, 'pnl': 0.0, 'tokens': [], 'timestamps': []}
-        dev_map[creator]['count'] += 1
-        dev_map[creator]['pnl'] += pnl
-        if symbol not in dev_map[creator]['tokens']:
-            dev_map[creator]['tokens'].append(symbol)
-        dev_map[creator]['timestamps'].append(sell_ts)
-        print('[Hicarus] DIST: ' + creator[:12] + '... created ' + symbol
-              + ' (PnL ' + str(round(pnl, 2)) + ')')
+    # 3. Pre-fetch activities for ALL creators ONCE (cache)
+    creator_activity_cache = {}
+    for creator in creator_set:
+        creator_activity_cache[creator] = gmgn_activity(creator)
+        print('[Hicarus] Fetched ' + str(len(creator_activity_cache[creator]))
+              + ' activities for ' + creator[:12] + '...')
+
+    # 4. For each token, check if creator is a Distributor using cached activities
+    dev_map = {}  # creator_addr -> {count, pnl, tokens, sell_timestamps}
+    for creator, token_list in creator_tokens.items():
+        cached_activities = creator_activity_cache.get(creator, [])
+        for token_addr, symbol in token_list:
+            is_dist, pnl, sell_ts = check_distributor_from_activities(cached_activities, token_addr)
+            if not is_dist:
+                continue
+            if creator not in dev_map:
+                dev_map[creator] = {'count': 0, 'pnl': 0.0, 'tokens': [], 'timestamps': []}
+            dev_map[creator]['count'] += 1
+            dev_map[creator]['pnl'] += pnl
+            if symbol not in dev_map[creator]['tokens']:
+                dev_map[creator]['tokens'].append(symbol)
+            dev_map[creator]['timestamps'].append(sell_ts)
+            print('[Hicarus] DIST: ' + creator[:12] + '... created ' + symbol
+                  + ' (PnL ' + str(round(pnl, 2)) + ')')
 
     sorted_devs = sorted(dev_map.items(), key=lambda x: (x[1]['count'], x[1]['pnl']), reverse=True)
     print('[Hicarus] ' + str(len(sorted_devs)) + ' Distributors found')
 
-    # 3. Auto-add
+    # 5. Auto-add
     conn2 = init_db()
     added = []
     for addr, info in sorted_devs:
@@ -263,7 +313,7 @@ def discover():
             print('[Hicarus] AUTO-ADDED: ' + addr[:12] + '...')
     conn2.close()
 
-    # 4. Format
+    # 6. Format
     now_str = datetime.now().strftime('%H:%M')
     lines = []
     lines.append('🎯 *Hicarus Discover — ' + now_str + '*')
