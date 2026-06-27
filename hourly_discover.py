@@ -19,10 +19,13 @@ DB_FILE       = '/home/ubuntu/hicarus/data/wallets.db'
 CHAT_ID       = '6170215817'
 MIN_CONF      = 2
 MAX_TOKENS    = 20
-MAX_ACTIVITY_PAGES = 10   # ~7-10 days back (30 trades/page × 10 = 300 trades max)
+MAX_ACTIVITY_PAGES = 5    # ~4-5 days back (30 trades/page × 5 = 150 trades)
 SELL_GAP_MAX  = 60   # seconds between buy and sell
 PUMP_LOOKBACK = 120  # seconds after sell to check kline
 ONE_SHOT_MIN  = 0.50 # ≥50% of buy amount in one sell tx (creator typical = 50% chunk)
+MCAP_MIN_USD  = 2000 # mcap at sell must be ≥$2k
+MCAP_MAX_USD  = 10000 # mcap at sell must be ≤$10k
+SOL_PRICE_USD = 1700 # approximate SOL price in USD (for mcap conversion)
 
 # ── Helpers ─────────────────────────────────────────────────────
 
@@ -179,9 +182,10 @@ def check_pump(token_addr, sell_timestamp):
 
 # ── Check if a wallet is a Distributor on a specific token ─────
 
-def check_distributor_from_activities(activities, token_addr):
+def check_distributor_from_activities(activities, token_addr, total_supply):
     """
     Full Distributor check for ONE token using pre-fetched activities.
+    mcap check: sell mcap must be between $2k-$10k (filters out low-liquidity junk).
     Returns (is_distributor, sell_pnl, sell_timestamp)
     """
 
@@ -199,6 +203,19 @@ def check_distributor_from_activities(activities, token_addr):
     if not sell_txs:
         return False, 0.0, 0
 
+    first_sell     = sell_txs[0]
+    sell_ts        = first_sell.get('timestamp', 0)
+    sell_token_amt = float(first_sell.get('token_amount', 0))
+    sell_quote_amt = float(first_sell.get('quote_amount', 0))
+
+    # ── mcap at sell time check ──
+    if total_supply and sell_token_amt > 0:
+        sell_price = sell_quote_amt / sell_token_amt  # SOL per token
+        mcap_sol   = sell_price * total_supply
+        mcap_usd   = mcap_sol * SOL_PRICE_USD
+        if not (MCAP_MIN_USD <= mcap_usd <= MCAP_MAX_USD):
+            return False, 0.0, 0
+
     # ── Trader case: BUY then SELL ──
     if buy_txs:
         total_bought   = sum(float(t.get('token_amount', 0)) for t in buy_txs)
@@ -207,8 +224,6 @@ def check_distributor_from_activities(activities, token_addr):
         pct = first_sell_amt / total_bought if total_bought > 0 else 0
         if gap < 0 or gap > SELL_GAP_MAX or pct < ONE_SHOT_MIN:
             return False, 0.0, 0
-        sell_ts    = sell_txs[0].get('timestamp', 0)
-        # Compute PnL from quote_amount
         buy_total  = sum(float(t.get('quote_amount', 0)) for t in buy_txs)
         sell_total = sum(float(t.get('quote_amount', 0)) for t in sell_txs)
         sell_pnl   = sell_total - buy_total
@@ -218,8 +233,6 @@ def check_distributor_from_activities(activities, token_addr):
         return True, sell_pnl, sell_ts
 
     # ── Creator case: no BUY, only SELL (creator distributes launch allocation) ──
-    first_sell = sell_txs[0]
-    sell_ts    = first_sell.get('timestamp', 0)
     sell_total = sum(float(t.get('quote_amount', 0)) for t in sell_txs)
     sell_pnl   = sell_total  # positive = SOL received
     pump = check_pump(token_addr, sell_ts)
@@ -259,15 +272,18 @@ def discover():
     tg_send('📊 ' + str(len(tokens)) + ' token found. Checking creators...')
     print('[Hicarus] ' + str(len(tokens)) + ' tokens collected')
 
-    # 2. Get all unique creators (fetch token info in batch)
-    creator_tokens = {}  # creator -> list of (token_addr, symbol)
+    # 2. Get all unique creators + supply (fetch token info in batch)
+    creator_tokens = {}   # creator -> list of (token_addr, symbol)
+    token_supply   = {}   # token_addr -> total_supply
     for token_addr, symbol in tokens:
-        token_info = gmgn_token_info(token_addr)
-        dev_info   = token_info.get('dev', {}) or {}
-        creator    = dev_info.get('creator_address', '')
+        token_info   = gmgn_token_info(token_addr)
+        dev_info     = token_info.get('dev', {}) or {}
+        creator      = dev_info.get('creator_address', '')
+        total_supply = float(token_info.get('total_supply') or token_info.get('circulating_supply') or 0)
         if not creator:
             continue
         creator_set.add(creator)
+        token_supply[token_addr] = total_supply
         if creator not in creator_tokens:
             creator_tokens[creator] = []
         creator_tokens[creator].append((token_addr, symbol))
@@ -297,7 +313,8 @@ def discover():
         creator_passed = False  # did this creator pass the one-shot filter?
 
         for token_addr, symbol in token_list:
-            is_dist, pnl, sell_ts = check_distributor_from_activities(cached_activities, token_addr)
+            total_supply = token_supply.get(token_addr, 0)
+            is_dist, pnl, sell_ts = check_distributor_from_activities(cached_activities, token_addr, total_supply)
             if not is_dist:
                 continue
 
