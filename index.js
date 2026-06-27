@@ -1,6 +1,5 @@
 import 'dotenv/config';
-import { Telegraf } from 'telegraf';
-import { getSettings } from './src/db.js';
+import { Telegraf, Markup } from 'telegraf';
 import {
   handleAdd, handleRemove, handleList, handleWallet,
   handleHelp, handleGuide, handleSeed, handleDiscover,
@@ -14,7 +13,37 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf(BOT_TOKEN);
 
+// ── Menu ───────────────────────────────────────────────────────
+
+function mainMenuKeyboard() {
+  return Markup.keyboard([
+    ['🚀 Discover Now', '🌱 Add Seed Wallets'],
+    ['📋 Watchlist', '👛 Wallet Stats'],
+    ['📖 Guide', '❓ Help'],
+  ]).resize().persistent();
+}
+
+async function showMenu(ctx) {
+  const text = `*Hicarus — Wallet Discovery Engine*\n\n` +
+    `Every hour, Hicarus finds new dev wallets and sends results here.\n\n` +
+    `Tap a button or type a command:\n` +
+    `🚀 *Discover* — find wallets right now\n` +
+    `🌱 *Seed* — add starting dev wallets\n` +
+    `📋 *Watchlist* — view tracked wallets\n` +
+    `👛 *Wallet* — GMGN stats for any address\n\n` +
+    `Next auto-discover: ~1 hour ⏰`;
+  await ctx.reply(text, { parse_mode: 'Markdown', reply_markup: mainMenuKeyboard() });
+}
+
 // ── Commands ───────────────────────────────────────────────────
+
+bot.command('start', async (ctx) => {
+  await showMenu(ctx);
+});
+
+bot.command('menu', async (ctx) => {
+  await showMenu(ctx);
+});
 
 bot.command('seed',     handleSeed);
 bot.command('discover', handleDiscover);
@@ -25,41 +54,41 @@ bot.command('wallet',   handleWallet);
 bot.command('guide',    handleGuide);
 bot.command('help',     handleHelp);
 
+// ── Text button handlers ────────────────────────────────────────
+// When user taps a ReplyKeyboard button, it sends the text as a message.
+// We catch common button texts here.
+
+bot.on('text', async (ctx) => {
+  const text = ctx.message.text;
+  switch (text) {
+    case '🚀 Discover Now':
+      return handleDiscover(ctx);
+    case '🌱 Add Seed Wallets':
+      return handleSeed(ctx);
+    case '📋 Watchlist':
+      return handleList(ctx);
+    case '👛 Wallet Stats':
+      await ctx.reply('📝 Format: `/wallet <address>`\nContoh: `/wallet 8inTY66csRNgKNtGhqGhd4odAV2VeJBDcRVuF7UE3Eeh`', { parse_mode: 'Markdown' });
+      return;
+    case '📖 Guide':
+      return handleGuide(ctx);
+    case '❓ Help':
+      return handleHelp(ctx);
+    default:
+      return; // Let other text pass — maybe it's a command
+  }
+});
+
 // ── Boot ──────────────────────────────────────────────────────
 
 async function boot() {
   console.log('[Hicarus] Starting...');
-  console.log('[Hicarus] Polling disabled — discovery on-demand + hourly cron');
-
-  // Simple cron: run discover every 60 minutes
-  // Stored as interval so we can clear on shutdown
-  const CRON_MS = 60 * 60 * 1000;
-  const discoverCron = setInterval(async () => {
-    console.log('[Hicarus] ⏰ Hourly discover triggered');
-    try {
-      // Import dynamically to avoid circular
-      const { handleDiscover } = await import('./src/commands.js');
-      // Auto-discover has no ctx, so we use a mock-like approach
-      // Actually, we just log — the user runs /discover manually or
-      // we can do a silent discover and push results
-      console.log('[Hicarus] Run /discover manually or setup webhook push');
-    } catch (err) {
-      console.error('[Hicarus] Cron error:', err.message);
-    }
-  }, CRON_MS);
 
   bot.launch();
   console.log('[Hicarus] Bot launched ✅');
 
-  const shutdown = (signal) => {
-    console.log(`[Hicarus] ${signal} — shutting down...`);
-    clearInterval(discoverCron);
-    bot.stop(signal);
-    process.exit(0);
-  };
-
-  process.once('SIGINT',  () => shutdown('SIGINT'));
-  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT',  () => { bot.stop('SIGINT');  process.exit(0); });
+  process.once('SIGTERM', () => { bot.stop('SIGTERM'); process.exit(0); });
 }
 
 boot().catch(err => {
