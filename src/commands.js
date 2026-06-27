@@ -77,14 +77,21 @@ export async function handleList(ctx) {
   const userId = ctx.from.id;
   if (userId !== parseInt(process.env.AUTHORIZED_USER_ID)) return unauthorized(ctx);
   const wallets = listWallets(userId);
-  if (wallets.length === 0) return ctx.reply('📭 Watchlist kosong. Gunakan `/add <wallet>` untuk menambah.');
-  let text = `📋 *Watchlist* (${wallets.length})\n\n`;
+  if (wallets.length === 0) return ctx.reply('📭 Watchlist kosong. Bot auto-add wallets setiap jam.');
+
+  let text = `📋 *Watchlist* (${wallets.length})\n`;
+  text += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
   wallets.forEach((w, i) => {
-    const short = w.wallet.slice(0, 8) + '...' + w.wallet.slice(-6);
-    text += `${i + 1}. \`${short}\`\n`;
-    if (w.label) text += `   🏷 ${w.label}\n`;
-    text += `   ${w.active ? '🟢 Aktif' : '⚪ Paused'}\n\n`;
+    const pnl = typeof w.total_pnl === 'number' ? (w.total_pnl >= 0 ? '+' + w.total_pnl.toFixed(2) : w.total_pnl.toFixed(2)) : '—';
+    const conf = w.confidence || 0;
+    text += `${i + 1}. ${w.label || 'Wallet'}\n`;
+    text += `\`${w.wallet}\`\n`;
+    text += `   📊 ${conf}x · PnL: ${pnl} SOL · ${w.active ? '🟢 Aktif' : '⚪ Paused'}\n\n`;
   });
+
+  text += `━━━━━━━━━━━━━━━━━━━━\n`;
+  text += `Full address = tap untuk copy`;
   ctx.reply(text, { parse_mode: 'Markdown' });
 }
 

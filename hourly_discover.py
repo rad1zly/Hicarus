@@ -147,10 +147,10 @@ def discover():
 
     if added:
         lines.append('✅ *' + str(len(added)) + ' wallet AUTO-ADDED to watchlist*')
-        for addr, info in added[:5]:
-            short = addr[:8] + '...' + addr[-6:]
+        for addr, info in added[:8]:
             pnl_str = '+' + str(round(info['pnl'],2)) if info['pnl'] >= 0 else str(round(info['pnl'],2))
-            lines.append('`' + short + '` · ' + str(info['count']) + 'x · PnL ' + pnl_str + ' SOL')
+            lines.append('`' + addr + '`')
+            lines.append('   📈 ' + str(info['count']) + 'x · PnL ' + pnl_str + ' SOL · ' + ', '.join(info['tokens'][:3]))
         lines.append('')
         lines.append('━━━━━━━━━━━━━━━━━━━━')
         lines.append('')
@@ -162,9 +162,8 @@ def discover():
     if high:
         lines.append('🔥 *HIGH CONFIDENCE* (≥' + str(MIN_CONF) + 'x)')
         for i, (addr, info) in enumerate(high[:8]):
-            short = addr[:8] + '...' + addr[-6:]
             pnl_str = '+' + str(round(info['pnl'],2)) if info['pnl'] >= 0 else str(round(info['pnl'],2))
-            lines.append(str(i+1) + '. `' + short + '`')
+            lines.append(str(i+1) + '. `' + addr + '`')
             lines.append('   📈 ' + str(info['count']) + 'x · PnL: ' + pnl_str + ' SOL')
             lines.append('   🐸 ' + ', '.join(info['tokens'][:4]))
         lines.append('')
@@ -172,9 +171,8 @@ def discover():
     if medium:
         lines.append('⚡ *MEDIUM* (2x)')
         for addr, info in medium[:5]:
-            short = addr[:8] + '...' + addr[-6:]
             pnl_str = '+' + str(round(info['pnl'],2)) if info['pnl'] >= 0 else str(round(info['pnl'],2))
-            lines.append('• `' + short + '` · ' + str(info['count']) + 'x · PnL: ' + pnl_str)
+            lines.append('• `' + addr + '` · ' + str(info['count']) + 'x · PnL: ' + pnl_str)
         lines.append('')
 
     if low:
