@@ -2,124 +2,190 @@
 """
 Hicarus — Hourly Discover
 Run by cron every hour.
-Uses GMGN CLI to find new dev wallets from seed wallets,
-formats results, and sends to Telegram.
+Finds new dev wallets via GMGN CLI -> auto-adds HIGH confidence to SQLite -> pushes to Telegram.
 """
-import subprocess, json, sys, urllib.request, urllib.parse
+import subprocess, json, urllib.request, urllib.parse, sqlite3, os
+from datetime import datetime
 
-# ── Config ─────────────────────────────────────────────────────
-TELEGRAM_TOKEN = open('/home/ubuntu/hicarus/.env').read().split('BOT_TOKEN=')[1].split('\n')[0].strip()
-CHAT_ID = '6170215817'
-SEED_WALLETS = [
+# Config
+DB_FILE   = '/home/ubuntu/hicarus/data/wallets.db'
+CHAT_ID   = '6170215817'
+MIN_CONF  = 3   # auto-add wallets with >=3 appearances
+
+SEEDS = [
     '8inTY66csRNgKNtGhqGhd4odAV2VeJBDcRVuF7UE3Eeh',
     '6WM3V5hPSbbb7WNsLmo2QbbAc7vwJ6dumg1ypPXdv3cR',
 ]
 
-def gmgn(cmd):
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=20)
+def get_env(key):
+    with open('/home/ubuntu/hicarus/.env') as f:
+        for line in f:
+            if line.startswith(key):
+                return line.split('=', 1)[1].strip()
+    return ''
+
+def gmgn():
     try:
         with open('/tmp/gmgn_out.txt') as f:
             raw = f.read()
-        start = raw.find('[')
-        end = raw.rfind(']') + 1
-        return json.loads(raw[start:end]) if start >= 0 else []
+        s = raw.find('[')
+        e = raw.rfind(']') + 1
+        return json.loads(raw[s:e]) if s >= 0 else []
     except:
         return []
 
-def send_telegram(text):
-    data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'text': text, 'parse_mode': 'Markdown'}).encode()
+def tg_send(text, rows=None):
+    payload = {
+        'chat_id': CHAT_ID,
+        'text': text,
+        'parse_mode': 'Markdown',
+    }
+    if rows:
+        payload['reply_markup'] = json.dumps({'inline_keyboard': rows})
+    data = urllib.parse.urlencode(payload).encode()
     req = urllib.request.Request(
-        f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage',
+        'https://api.telegram.org/bot' + get_env('BOT_TOKEN') + '/sendMessage',
         data=data, method='POST'
     )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    with urllib.request.urlopen(req) as r:
+        res = json.loads(r.read())
+        assert res.get('ok'), str(res)
+        return res['result']['message_id']
 
-def main():
-    print('[Hicarus Discover] Starting...')
-    send_telegram('⏰ *Hicarus Hourly Discover*\nMenganalisis token dari seed wallets...')
+def init_db():
+    os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS watchlist (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            wallet     TEXT    NOT NULL UNIQUE,
+            label      TEXT,
+            added_by   INTEGER NOT NULL,
+            added_at   INTEGER NOT NULL,
+            active     INTEGER DEFAULT 1,
+            last_tx    TEXT,
+            confidence  INTEGER DEFAULT 0,
+            total_pnl  REAL    DEFAULT 0
+        )
+    ''')
+    conn.commit()
+    return conn
 
-    # Step 1: Collect unique tokens from seed wallet sell events
+def db_has(conn, addr):
+    return conn.execute('SELECT 1 FROM watchlist WHERE wallet=?', (addr,)).fetchone() is not None
+
+def db_add(conn, addr, label, conf, pnl):
+    now = int(datetime.now().timestamp())
+    conn.execute('''
+        INSERT OR IGNORE INTO watchlist (wallet,label,added_by,added_at,active,confidence,total_pnl)
+        VALUES (?,?,?,?,1,?,?)
+    ''', (addr, label, int(CHAT_ID), now, conf, pnl))
+    conn.commit()
+
+def discover():
+    conn = init_db()
     token_map = {}
-    for wallet in SEED_WALLETS:
-        cmd = f'gmgn-cli portfolio activity --chain sol --wallet {wallet} --limit 30 2>/dev/null > /tmp/gmgn_out.txt'
-        subprocess.run(cmd, shell=True)
-        acts = gmgn([])
-        for a in acts:
+
+    # 1. Collect tokens from seeds
+    tg_send('🔍 *Hicarus Discover*\nMenganalisis token dari seed wallets...')
+    for wallet in SEEDS:
+        subprocess.run(
+            'gmgn-cli portfolio activity --chain sol --wallet ' + wallet + ' --limit 30 2>/dev/null > /tmp/gmgn_out.txt',
+            shell=True, timeout=25
+        )
+        for a in gmgn():
             if a.get('event_type') == 'sell' and a.get('token', {}).get('address'):
                 tok = a['token']['address']
                 if tok not in token_map:
-                    token_map[tok] = {
-                        'symbol': a['token'].get('symbol', tok[:8]),
-                        'dev': wallet[:12],
-                    }
+                    token_map[tok] = a['token'].get('symbol', tok[:8])
 
-    token_list = list(token_map.items())
-    print(f'[Hicarus] {len(token_list)} tokens found from seeds')
-    send_telegram(f'📊 {len(token_list)} token ditemukan. Mengecek trader data...')
+    tokens = list(token_map.items())
+    tg_send('📊 ' + str(len(tokens)) + ' token ditemukan. Mengecek trader data...')
+    print('[Hicarus] ' + str(len(tokens)) + ' tokens from seeds')
 
-    # Step 2: For each token, find dev wallets
-    dev_wallets = {}
-    for token_addr, info in token_list[:20]:  # limit to 20 tokens
-        cmd = f'gmgn-cli token traders --chain sol --address {token_addr} --limit 30 --raw 2>/dev/null > /tmp/gmgn_out.txt'
-        subprocess.run(cmd, shell=True)
-        traders = gmgn([])
-        for t in traders:
+    # 2. Find dev wallets
+    dev_map = {}
+    for token_addr, symbol in tokens[:25]:
+        subprocess.run(
+            'gmgn-cli token traders --chain sol --address ' + token_addr + ' --limit 30 --raw 2>/dev/null > /tmp/gmgn_out.txt',
+            shell=True, timeout=25
+        )
+        for t in gmgn():
             tags = t.get('maker_token_tags', []) + t.get('tags', [])
-            is_dev = 'dev_team' in tags or 'creator' in tags
-            is_seed = t.get('address', '') in SEED_WALLETS
-            if is_dev and not is_seed:
+            if ('dev_team' in tags or 'creator' in tags) and t.get('address') not in SEEDS:
                 addr = t['address']
-                profit = float(t.get('profit', 0) or 0)
-                if addr not in dev_wallets:
-                    dev_wallets[addr] = {'count': 0, 'pnl': 0, 'tokens': [], 'tags': list(set(tags))}
-                dev_wallets[addr]['count'] += 1
-                dev_wallets[addr]['pnl'] += profit
-                sym = token_map[token_addr]['symbol']
-                if sym not in dev_wallets[addr]['tokens']:
-                    dev_wallets[addr]['tokens'].append(sym)
+                profit = float(t.get('profit') or 0)
+                if addr not in dev_map:
+                    dev_map[addr] = {'count': 0, 'pnl': 0, 'tokens': [], 'tags': list(set(tags))}
+                dev_map[addr]['count'] += 1
+                dev_map[addr]['pnl'] += profit
+                sym = token_map.get(token_addr, addr[:8])
+                if sym not in dev_map[addr]['tokens']:
+                    dev_map[addr]['tokens'].append(sym)
 
-    # Step 3: Sort by count desc, then pnl desc
-    sorted_devs = sorted(dev_wallets.items(), key=lambda x: (x[1]['count'], x[1]['pnl']), reverse=True)
-    print(f'[Hicarus] {len(sorted_devs)} dev wallets found')
+    sorted_devs = sorted(dev_map.items(), key=lambda x: (x[1]['count'], x[1]['pnl']), reverse=True)
+    print('[Hicarus] ' + str(len(sorted_devs)) + ' dev wallets found')
 
-    if not sorted_devs:
-        send_telegram('❌ Tidak ada dev wallet baru ditemukan kali ini.')
-        return
+    # 3. Auto-add HIGH confidence to DB
+    added = []
+    for addr, info in sorted_devs:
+        if info['count'] >= MIN_CONF and not db_has(conn, addr):
+            label = 'Auto #'+str(info['count'])+'x ' + ', '.join(info['tokens'][:3])
+            db_add(conn, addr, label, info['count'], info['pnl'])
+            added.append((addr, info))
+            print('[Hicarus] AUTO-ADDED: ' + addr[:12] + '... (' + str(info['count']) + 'x, PnL ' + str(round(info['pnl'],2)) + ')')
 
-    # Step 4: Format and send
-    now = __import__('datetime').datetime.now().strftime('%H:%M')
-    text = f'🎯 *Hicarus Discover — {now}*\n'
-    text += f'Dari {len(token_list)} token · {len(sorted_devs)} dev wallet ditemukan\n\n'
-    text += '━━━━━━━━━━━━━━━━━━━━\n\n'
+    conn.close()
 
-    high = [(a, d) for a, d in sorted_devs if d['count'] >= 3]
-    medium = [(a, d) for a, d in sorted_devs if d['count'] == 2]
+    # 4. Format results
+    now_str = datetime.now().strftime('%H:%M')
+    lines = []
+    lines.append('🎯 *Hicarus Discover — ' + now_str + '*')
+    lines.append('Dari ' + str(len(tokens)) + ' token · ' + str(len(sorted_devs)) + ' dev wallet ditemukan')
+    lines.append('_confidence = appearances × PnL_')
+    lines.append('')
+
+    if added:
+        lines.append('✅ *' + str(len(added)) + ' wallet AUTO-ADDED to watchlist*')
+        for addr, info in added[:5]:
+            short = addr[:8] + '...' + addr[-6:]
+            pnl_str = '+' + str(round(info['pnl'],2)) if info['pnl'] >= 0 else str(round(info['pnl'],2))
+            lines.append('`' + short + '` · ' + str(info['count']) + 'x · PnL ' + pnl_str + ' SOL')
+        lines.append('')
+        lines.append('━━━━━━━━━━━━━━━━━━━━')
+        lines.append('')
+
+    high   = [(a,d) for a,d in sorted_devs if d['count'] >= MIN_CONF]
+    medium = [(a,d) for a,d in sorted_devs if d['count'] == 2]
+    low    = [(a,d) for a,d in sorted_devs if d['count'] == 1]
 
     if high:
-        text += f'🔥 *HIGH CONFIDENCE* (≥3x)\n'
+        lines.append('🔥 *HIGH CONFIDENCE* (≥' + str(MIN_CONF) + 'x)')
         for i, (addr, info) in enumerate(high[:8]):
             short = addr[:8] + '...' + addr[-6:]
-            pnl_str = f'+{info["pnl"]:.2f}' if info['pnl'] >= 0 else f'{info["pnl"]:.2f}'
-            text += f'\n{i+1}. `{short}`\n'
-            text += f'   📈 {info["count"]}x · PnL: {pnl_str} SOL\n'
-            text += f'   🐸 {", ".join(info["tokens"][:4])}\n'
-            text += f'   /add {addr}\n'
+            pnl_str = '+' + str(round(info['pnl'],2)) if info['pnl'] >= 0 else str(round(info['pnl'],2))
+            lines.append(str(i+1) + '. `' + short + '`')
+            lines.append('   📈 ' + str(info['count']) + 'x · PnL: ' + pnl_str + ' SOL')
+            lines.append('   🐸 ' + ', '.join(info['tokens'][:4]))
+        lines.append('')
 
     if medium:
-        text += f'\n⚡ *MEDIUM* (2x)\n'
+        lines.append('⚡ *MEDIUM* (2x)')
         for addr, info in medium[:5]:
             short = addr[:8] + '...' + addr[-6:]
-            pnl_str = f'+{info["pnl"]:.2f}' if info['pnl'] >= 0 else f'{info["pnl"]:.2f}'
-            text += f'• `{short}` · {info["count"]}x · PnL: {pnl_str}\n'
+            pnl_str = '+' + str(round(info['pnl'],2)) if info['pnl'] >= 0 else str(round(info['pnl'],2))
+            lines.append('• `' + short + '` · ' + str(info['count']) + 'x · PnL: ' + pnl_str)
+        lines.append('')
 
-    text += '\n━━━━━━━━━━━━━━━━━━━━\n'
-    text += '*Confidence: appearances × PnL*\n'
-    text += 'Gunakan /add <address> untuk add ke watchlist.\n'
-    text += 'Next run: 1 jam lagi ⏰'
+    if low:
+        lines.append('🟡 *LOW* (1x) — cek /wallet ' + low[0][0] + ' untuk detail')
+        lines.append('')
 
-    send_telegram(text)
-    print('[Hicarus Discover] Done — results sent to Telegram')
+    lines.append('━━━━━━━━━━━━━━━━━━━━')
+    lines.append('Next run: 1 jam lagi ⏰')
+
+    tg_send('\n'.join(lines))
+    print('[Hicarus Discover] Done — ' + str(len(added)) + ' auto-added, ' + str(len(sorted_devs)) + ' total found')
 
 if __name__ == '__main__':
-    main()
+    discover()
